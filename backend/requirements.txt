@@ -1,6 +1,6 @@
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
-strands-agents[anthropic,openai,ollama]>=1.0.0
+strands-agents[anthropic,openai,ollama,gemini,mistral]>=1.0.0
 pandas>=2.2.0
 numpy>=1.26.0
 matplotlib>=3.9.0

@@ -1,7 +1,16 @@
-"""LLM provider configuration — supports Anthropic, OpenAI, and Ollama."""
+"""LLM provider configuration — supports Anthropic, OpenAI, Gemini, Mistral, and Ollama."""
 
 import os
 from dataclasses import dataclass, field
+
+# Best models for tool calling per provider (February 2026)
+DEFAULT_MODELS = {
+    "anthropic": "claude-sonnet-4-6",
+    "openai": "gpt-4.1",
+    "gemini": "gemini-2.5-flash",
+    "mistral": "mistral-large-latest",
+    "ollama": "llama3.1",
+}
 
 
 @dataclass
@@ -20,11 +29,7 @@ class LLMConfig:
         self.base_url = self.base_url or os.getenv("LLM_BASE_URL", "")
 
         if not self.model:
-            self.model = {
-                "anthropic": "claude-sonnet-4-20250514",
-                "openai": "gpt-4o",
-                "ollama": "llama3.1",
-            }.get(self.provider, "claude-sonnet-4-20250514")
+            self.model = DEFAULT_MODELS.get(self.provider, "claude-sonnet-4-6")
 
         if not self.base_url and self.provider == "ollama":
             self.base_url = "http://localhost:11434"
@@ -67,6 +72,21 @@ def create_strands_model(config: LLMConfig):
             model_id=config.model,
             params={"max_tokens": config.max_tokens, "temperature": config.temperature},
         )
+    elif config.provider == "gemini":
+        from strands.models.gemini import GeminiModel
+
+        return GeminiModel(
+            client_args={"api_key": config.api_key} if config.api_key else None,
+            model_id=config.model,
+            params={"max_output_tokens": config.max_tokens, "temperature": config.temperature},
+        )
+    elif config.provider == "mistral":
+        from strands.models.mistral import MistralModel
+
+        return MistralModel(
+            api_key=config.api_key,
+            model_id=config.model,
+        )
     elif config.provider == "ollama":
         from strands.models.ollama import OllamaModel
 
@@ -75,7 +95,10 @@ def create_strands_model(config: LLMConfig):
             model_id=config.model,
         )
     else:
-        raise ValueError(f"Unknown provider: {config.provider}")
+        raise ValueError(
+            f"Unknown provider: '{config.provider}'. "
+            f"Supported: {', '.join(DEFAULT_MODELS.keys())}"
+        )
 
 
 def get_config() -> AppConfig:

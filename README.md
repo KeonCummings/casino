@@ -57,19 +57,49 @@ Set these in `.env`:
 
 | Variable | Default | Description |
 |---|---|---|
-| `LLM_PROVIDER` | `anthropic` | `anthropic`, `openai`, or `ollama` |
+| `LLM_PROVIDER` | `anthropic` | `anthropic`, `openai`, `gemini`, `mistral`, or `ollama` |
 | `LLM_API_KEY` | — | Your API key (not needed for Ollama) |
-| `LLM_MODEL` | auto | Model name (auto-selects per provider) |
+| `LLM_MODEL` | auto | Override the default model for your provider |
 | `LLM_BASE_URL` | — | Custom endpoint (required for Ollama if not localhost) |
 | `CASINO_EXEC_TIMEOUT` | `30` | Code execution timeout (seconds) |
 
-**Provider defaults:**
+### Providers and models
 
-| Provider | Default model |
-|---|---|
-| `anthropic` | `claude-sonnet-4-20250514` |
-| `openai` | `gpt-4o` |
-| `ollama` | `llama3.1` |
+Ca$ino supports 5 providers via [Strands Agents SDK](https://strandsagents.com/latest/documentation/docs/user-guide/concepts/model-providers/). Each auto-selects the best model for tool calling, or you can set `LLM_MODEL` to override.
+
+| Provider | Default model | Other good options | Get a key |
+|---|---|---|---|
+| `anthropic` | `claude-sonnet-4-6` | `claude-opus-4-6`, `claude-haiku-4-5` | [console.anthropic.com](https://console.anthropic.com/settings/keys) |
+| `openai` | `gpt-4.1` | `gpt-4.1-mini`, `gpt-4.1-nano`, `o3` | [platform.openai.com](https://platform.openai.com/api-keys) |
+| `gemini` | `gemini-2.5-flash` | `gemini-2.5-pro`, `gemini-2.0-flash` | [aistudio.google.com](https://aistudio.google.com/apikey) |
+| `mistral` | `mistral-large-latest` | `mistral-small-latest` | [console.mistral.ai](https://console.mistral.ai/api-keys) |
+| `ollama` | `llama3.1` | `qwen3`, `mistral`, `llama3.3` | No key needed |
+
+**Examples:**
+
+```bash
+# Anthropic (default)
+LLM_PROVIDER=anthropic
+LLM_API_KEY=sk-ant-...
+
+# OpenAI
+LLM_PROVIDER=openai
+LLM_API_KEY=sk-...
+LLM_MODEL=gpt-4.1          # or gpt-4.1-mini for cheaper
+
+# Google Gemini
+LLM_PROVIDER=gemini
+LLM_API_KEY=AI...
+
+# Mistral
+LLM_PROVIDER=mistral
+LLM_API_KEY=...
+
+# Ollama (local, no key needed)
+LLM_PROVIDER=ollama
+LLM_MODEL=llama3.1          # or qwen3, mistral, etc.
+# LLM_BASE_URL=http://localhost:11434  # default
+```
 
 ## Tools
 

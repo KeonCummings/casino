@@ -75,7 +75,7 @@ async def stream(request: Request):
     # Ensure workspace exists
     ensure_workspace(cfg.workspace_root, workspace_id)
 
-    if not cfg.llm.api_key and cfg.llm.provider != "ollama":
+    if not cfg.llm.api_key and cfg.llm.provider not in ("ollama",):
         return JSONResponse(
             {"error": f"LLM_API_KEY not set for provider '{cfg.llm.provider}'"},
             status_code=500,

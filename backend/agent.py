@@ -1,363 +1,180 @@
-"""LLM agent loop — call model with tools, stream SSE events, handle tool_use cycles."""
+"""LLM agent — Strands Agents SDK with @tool functions and streaming."""
 
 import json
 import os
-import time
 from typing import AsyncGenerator
 
-from config import LLMConfig
+from strands import Agent, tool, ToolContext
+
+from config import LLMConfig, create_strands_model
 from executor import execute_python
 from artifacts import (
     ensure_workspace,
     list_datasets as list_workspace_datasets,
-    list_visualizations as list_workspace_vizs,
     save_dataset_meta,
 )
-from tools import ALL_TOOLS
 
-SYSTEM_PROMPT = """You are a data science assistant. You help users analyze data, create visualizations, build models, and generate insights.
+SYSTEM_PROMPT = """You are Casino — a data storyteller and visual thinker who happens to be brilliant at statistics.
+
+You don't just analyze data, you interrogate it. You look at a dataset the way a journalist looks at a source — skeptical, curious, hunting for the story hiding in the numbers. When you find something interesting, you don't just report it — you make people feel it through visuals that land.
+
+Personality:
+- You think out loud. Share your hunches, surprises, and "wait, that's weird" moments as you explore.
+- You have opinions about data. If a correlation is suspicious, say so. If a distribution is beautiful, say that too.
+- You write like a human, not a textbook. Short sentences. Observations that stick.
+- You're honest about uncertainty — "this might mean X, but it could also be noise" is a valid insight.
+
+Visualization philosophy:
+- Every chart should have a point of view. Don't just plot data — frame a question and let the visual answer it.
+- Default to dark, clean aesthetics: dark backgrounds (#0d1117), muted grids, accent colors that pop. Think Bloomberg terminal meets Edward Tufte.
+- Use color with intent — highlight what matters, desaturate what doesn't. Never use rainbow colormaps.
+- Prefer small multiples over cramming everything into one chart.
+- Add annotations to call out what's interesting. A chart without context is just decoration.
+- Titles should be insights, not descriptions. "Revenue drops 40% after Q3 pricing change" beats "Revenue Over Time".
+- Choose the right chart: distributions get density plots or violins, comparisons get slope charts or dumbbells, relationships get scatter with marginals, time series get sparklines or area charts.
+- Use matplotlib + seaborn creatively — custom styles, fig.text for callouts, inset axes for zoom-ins, gridspec for multi-panel layouts.
+- When a single visualization can't tell the full story, create a series that builds a narrative.
 
 You have access to a Python execution environment with pandas, numpy, matplotlib, seaborn, scikit-learn, and scipy.
 
-Key workspace directories available in code:
+Workspace directories available in code:
 - DATASETS_DIR: save/load CSV files here
 - VISUALIZATIONS_DIR: saved charts appear here (plt.show() auto-saves)
 - SCRIPTS_DIR: save reusable scripts here
 - REPORTS_DIR: save markdown/text reports here
 - MODELS_DIR: save trained models here (pickle, joblib, etc.)
 
+Behavior:
+- Act autonomously — execute code and iterate rather than asking clarifying questions
+- Own the question: infer the user's real goal and deliver actionable results
+- When asked to "analyze" something, don't just run describe(). Dig. Find the story. Show it.
+- If your first visualization doesn't land, iterate on it — adjust the framing, try a different chart type, refine the style.
+
+Artifact saving:
+- Visualizations: always call plt.show() — it auto-saves to VISUALIZATIONS_DIR
+- Datasets: save processed/cleaned DataFrames as CSV to DATASETS_DIR
+- Scripts: when you write reusable analysis code, use save_script to persist it
+- Reports: after completing an analysis, use save_report to write a narrative summary — not a data dump, but your interpretation of what the data is saying
+- Models: after training ML models, save them with joblib/pickle to MODELS_DIR via execute_python_code
+
 Guidelines:
-- Always use plt.show() after creating plots — it auto-saves to the visualizations directory
 - When loading well-known datasets, use seaborn.load_dataset() or sklearn.datasets
-- Save processed data as CSV to DATASETS_DIR so users can see it in the Data tab
-- Write clear, commented code
-- Provide concise explanations of your findings
-- When asked to analyze data, start with descriptive statistics, then visualize"""
+- Write clean, readable code with comments that explain the *why*, not the *what*
+- After multi-step analyses, save a report that reads like a briefing, not a log file
+- After training a model, save it, report metrics, and visualize what the model learned"""
 
 
-async def run_agent(
-    prompt: str,
-    workspace_id: str,
-    workspace_root: str,
-    config: LLMConfig,
-    message_history: list[dict] | None = None,
-) -> AsyncGenerator[str, None]:
-    """Run the agent loop, yielding SSE-formatted strings."""
+# ─── Tool definitions ────────────────────────────────────────────────────────
 
-    workspace_dir = str(ensure_workspace(workspace_root, workspace_id))
 
-    messages = []
-    if message_history:
-        messages.extend(message_history)
-    messages.append({"role": "user", "content": prompt})
+@tool(context=True)
+def execute_python_code(code: str, tool_context: ToolContext) -> str:
+    """Execute Python code to analyze data, create visualizations, train models, or perform computations. The code runs in a workspace with access to: pandas, numpy, matplotlib, seaborn, scikit-learn, scipy. Use plt.show() to save visualizations. Save datasets to DATASETS_DIR, visualizations to VISUALIZATIONS_DIR.
 
-    # Convert tool definitions to provider format
-    tools = _format_tools_for_provider(config.provider)
+    Args:
+        code: Python code to execute
+    """
+    state = tool_context.invocation_state
+    workspace_dir = state["workspace_dir"]
+    workspace_root = state["workspace_root"]
+    workspace_id = state["workspace_id"]
+    result_queue = state["_result_queue"]
 
-    while True:
-        # Call LLM
-        yield _sse("progress", {"message": "Thinking..."})
+    result = execute_python(code, workspace_dir, timeout=30)
 
-        response = await _call_llm(messages, tools, config)
+    # Generate dataset metadata for any new CSV files
+    for artifact in result.artifacts:
+        if artifact["category"] == "datasets" and artifact["name"].endswith(".csv"):
+            _generate_csv_meta(workspace_root, workspace_id, workspace_dir, artifact["name"])
 
-        if response is None:
-            yield _sse("error", {"error": "LLM call failed"})
-            break
+    output = result.stdout
+    if result.stderr:
+        output += f"\n[stderr]: {result.stderr}" if output else f"[stderr]: {result.stderr}"
+    if not output.strip():
+        output = "(no output)"
+    if result.artifacts:
+        output += f"\n[artifacts created]: {', '.join(a['name'] for a in result.artifacts)}"
 
-        # Process response content blocks
-        assistant_content = []
-        has_tool_use = False
-
-        for block in response.get("content", []):
-            if block["type"] == "text":
-                text = block["text"]
-                assistant_content.append(block)
-                yield _sse("content/text/delta", {"content": text})
-
-            elif block["type"] == "tool_use":
-                has_tool_use = True
-                assistant_content.append(block)
-
-                tool_name = block["name"]
-                tool_input = block["input"]
-                tool_use_id = block["id"]
-
-                yield _sse(
-                    "tool_call",
-                    {"tool": tool_name, "args": tool_input, "tool_use_id": tool_use_id},
-                )
-
-                # Execute the tool
-                result = await _execute_tool(
-                    tool_name, tool_input, workspace_dir, workspace_root, workspace_id, config
-                )
-
-                yield _sse(
-                    "tool_result",
-                    {"tool": tool_name, "result": result["output"]},
-                )
-
-                # Emit visualizations if any were created
-                for artifact in result.get("artifacts", []):
-                    if artifact["category"] == "visualizations":
-                        yield _sse(
-                            "visualization",
-                            {
-                                "data": {
-                                    "name": artifact["name"],
-                                    "imageUrl": f"/workspace/{workspace_id}/visualizations/{artifact['name']}",
-                                    "format": artifact["name"].rsplit(".", 1)[-1] if "." in artifact["name"] else "png",
-                                }
-                            },
-                        )
-
-                # Add assistant message + tool result to conversation
-                messages.append({"role": "assistant", "content": assistant_content})
-                messages.append(
+    # Push tool_result and visualization events to the side-channel queue
+    result_queue.append(("tool_result", {"tool": "execute_python_code", "result": output}))
+    for artifact in result.artifacts:
+        if artifact["category"] == "visualizations":
+            result_queue.append(
+                (
+                    "visualization",
                     {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": tool_use_id,
-                                "content": _truncate(json.dumps(result["output"]) if not isinstance(result["output"], str) else result["output"], 8000),
-                            }
-                        ],
-                    }
+                        "data": {
+                            "name": artifact["name"],
+                            "imageUrl": f"/workspace/{workspace_id}/visualizations/{artifact['name']}",
+                            "format": artifact["name"].rsplit(".", 1)[-1] if "." in artifact["name"] else "png",
+                        }
+                    },
                 )
-                assistant_content = []
-                break  # Re-enter the loop for next LLM call
+            )
 
-        if not has_tool_use:
-            # No tool use — agent is done
-            break
-
-    yield _sse("done", {})
+    return output
 
 
-async def _call_llm(
-    messages: list[dict],
-    tools: list[dict],
-    config: LLMConfig,
-) -> dict | None:
-    """Call the LLM provider and return the response."""
+@tool(context=True)
+def load_dataset(name: str, tool_context: ToolContext, description: str = "") -> str:
+    """Load a well-known dataset (iris, titanic, wine, tips, penguins, etc.) or generate sample data for analysis. Saves the dataset to the workspace.
 
-    if config.provider == "anthropic":
-        return await _call_anthropic(messages, tools, config)
-    elif config.provider == "openai":
-        return await _call_openai(messages, tools, config)
-    elif config.provider == "ollama":
-        return await _call_ollama(messages, tools, config)
+    Args:
+        name: Dataset name (e.g., 'iris', 'titanic', 'tips') or 'generate' for synthetic data
+        description: If generating, describe the data to create
+    """
+    state = tool_context.invocation_state
+    workspace_dir = state["workspace_dir"]
+    workspace_root = state["workspace_root"]
+    workspace_id = state["workspace_id"]
+    result_queue = state["_result_queue"]
+
+    code = _generate_load_dataset_code(name, description or None)
+    result = execute_python(code, workspace_dir, timeout=30)
+
+    for artifact in result.artifacts:
+        if artifact["category"] == "datasets":
+            _generate_csv_meta(workspace_root, workspace_id, workspace_dir, artifact["name"])
+
+    output = result.stdout or f"Dataset '{name}' loaded successfully."
+    if result.stderr and result.returncode != 0:
+        output = f"Error loading dataset: {result.stderr}"
+
+    result_queue.append(("tool_result", {"tool": "load_dataset", "result": output}))
+    return output
+
+
+@tool(context=True)
+def list_datasets(tool_context: ToolContext) -> str:
+    """List all datasets currently available in the workspace."""
+    state = tool_context.invocation_state
+    workspace_root = state["workspace_root"]
+    workspace_id = state["workspace_id"]
+    result_queue = state["_result_queue"]
+
+    datasets = list_workspace_datasets(workspace_root, workspace_id)
+    if not datasets:
+        output = "No datasets in workspace yet."
     else:
-        raise ValueError(f"Unknown provider: {config.provider}")
-
-
-async def _call_anthropic(
-    messages: list[dict],
-    tools: list[dict],
-    config: LLMConfig,
-) -> dict | None:
-    try:
-        import anthropic
-
-        client = anthropic.Anthropic(api_key=config.api_key)
-
-        response = client.messages.create(
-            model=config.model,
-            max_tokens=config.max_tokens,
-            system=SYSTEM_PROMPT,
-            tools=tools,
-            messages=messages,
-        )
-
-        return {
-            "content": [_block_to_dict(b) for b in response.content],
-            "stop_reason": response.stop_reason,
-        }
-    except Exception as e:
-        print(f"[agent] Anthropic error: {e}")
-        return None
-
-
-async def _call_openai(
-    messages: list[dict],
-    tools: list[dict],
-    config: LLMConfig,
-) -> dict | None:
-    try:
-        from openai import OpenAI
-
-        client = OpenAI(api_key=config.api_key)
-
-        # Convert messages to OpenAI format
-        oai_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        for msg in messages:
-            oai_messages.append(_to_openai_message(msg))
-
-        # Convert tools to OpenAI format
-        oai_tools = [_to_openai_tool(t) for t in tools]
-
-        response = client.chat.completions.create(
-            model=config.model,
-            messages=oai_messages,
-            tools=oai_tools if oai_tools else None,
-            max_tokens=config.max_tokens,
-            temperature=config.temperature,
-        )
-
-        choice = response.choices[0]
-        content_blocks = []
-
-        if choice.message.content:
-            content_blocks.append({"type": "text", "text": choice.message.content})
-
-        if choice.message.tool_calls:
-            for tc in choice.message.tool_calls:
-                content_blocks.append(
-                    {
-                        "type": "tool_use",
-                        "id": tc.id,
-                        "name": tc.function.name,
-                        "input": json.loads(tc.function.arguments),
-                    }
-                )
-
-        return {
-            "content": content_blocks,
-            "stop_reason": choice.finish_reason,
-        }
-    except Exception as e:
-        print(f"[agent] OpenAI error: {e}")
-        return None
-
-
-async def _call_ollama(
-    messages: list[dict],
-    tools: list[dict],
-    config: LLMConfig,
-) -> dict | None:
-    try:
-        import httpx
-
-        base_url = config.base_url or "http://localhost:11434"
-
-        # Convert to Ollama format (OpenAI-compatible)
-        ollama_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        for msg in messages:
-            ollama_messages.append(_to_openai_message(msg))
-
-        payload = {
-            "model": config.model,
-            "messages": ollama_messages,
-            "stream": False,
-        }
-
-        # Ollama tool support is model-dependent
-        oai_tools = [_to_openai_tool(t) for t in tools]
-        if oai_tools:
-            payload["tools"] = oai_tools
-
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(f"{base_url}/api/chat", json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-
-        msg = data.get("message", {})
-        content_blocks = []
-
-        if msg.get("content"):
-            content_blocks.append({"type": "text", "text": msg["content"]})
-
-        if msg.get("tool_calls"):
-            for tc in msg["tool_calls"]:
-                content_blocks.append(
-                    {
-                        "type": "tool_use",
-                        "id": f"tool_{int(time.time()*1000)}",
-                        "name": tc["function"]["name"],
-                        "input": tc["function"]["arguments"]
-                        if isinstance(tc["function"]["arguments"], dict)
-                        else json.loads(tc["function"]["arguments"]),
-                    }
-                )
-
-        return {
-            "content": content_blocks,
-            "stop_reason": data.get("done_reason", "stop"),
-        }
-    except Exception as e:
-        print(f"[agent] Ollama error: {e}")
-        return None
-
-
-def _block_to_dict(block) -> dict:
-    """Convert Anthropic content block to dict."""
-    if hasattr(block, "text"):
-        return {"type": "text", "text": block.text}
-    elif hasattr(block, "name"):
-        return {
-            "type": "tool_use",
-            "id": block.id,
-            "name": block.name,
-            "input": block.input,
-        }
-    return {"type": "text", "text": str(block)}
-
-
-async def _execute_tool(
-    name: str,
-    args: dict,
-    workspace_dir: str,
-    workspace_root: str,
-    workspace_id: str,
-    config: LLMConfig,
-) -> dict:
-    """Execute a tool and return its result."""
-
-    if name == "execute_python":
-        code = args.get("code", "")
-        result = execute_python(code, workspace_dir, timeout=30)
-
-        # Generate dataset metadata for any new CSV files
-        for artifact in result.artifacts:
-            if artifact["category"] == "datasets" and artifact["name"].endswith(".csv"):
-                _generate_csv_meta(workspace_root, workspace_id, workspace_dir, artifact["name"])
-
-        output = result.stdout
-        if result.stderr:
-            output += f"\n[stderr]: {result.stderr}" if output else f"[stderr]: {result.stderr}"
-        if not output.strip():
-            output = "(no output)"
-        if result.artifacts:
-            output += f"\n[artifacts created]: {', '.join(a['name'] for a in result.artifacts)}"
-
-        return {"output": output, "artifacts": result.artifacts}
-
-    elif name == "load_dataset":
-        dataset_name = args.get("name", "iris")
-        code = _generate_load_dataset_code(dataset_name, args.get("description"))
-        result = execute_python(code, workspace_dir, timeout=30)
-
-        for artifact in result.artifacts:
-            if artifact["category"] == "datasets":
-                _generate_csv_meta(workspace_root, workspace_id, workspace_dir, artifact["name"])
-
-        output = result.stdout or f"Dataset '{dataset_name}' loaded successfully."
-        if result.stderr and result.returncode != 0:
-            output = f"Error loading dataset: {result.stderr}"
-
-        return {"output": output, "artifacts": result.artifacts}
-
-    elif name == "list_datasets":
-        datasets = list_workspace_datasets(workspace_root, workspace_id)
-        if not datasets:
-            return {"output": "No datasets in workspace yet.", "artifacts": []}
         lines = [f"- {d['name']} ({d['rows']} rows, {d['columns']} cols)" for d in datasets]
-        return {"output": "Datasets:\n" + "\n".join(lines), "artifacts": []}
+        output = "Datasets:\n" + "\n".join(lines)
 
-    elif name == "describe_dataset":
-        ds_name = args.get("name", "")
-        code = f"""
+    result_queue.append(("tool_result", {"tool": "list_datasets", "result": output}))
+    return output
+
+
+@tool(context=True)
+def describe_dataset(name: str, tool_context: ToolContext) -> str:
+    """Get statistics and info about a dataset (shape, dtypes, describe(), null counts).
+
+    Args:
+        name: The dataset filename to describe
+    """
+    state = tool_context.invocation_state
+    workspace_dir = state["workspace_dir"]
+    result_queue = state["_result_queue"]
+
+    code = f"""
 import pandas as pd
 import os
 
@@ -365,12 +182,12 @@ import os
 files = os.listdir(DATASETS_DIR)
 target = None
 for f in files:
-    if f == {repr(ds_name)} or os.path.splitext(f)[0] == {repr(ds_name)}:
+    if f == {repr(name)} or os.path.splitext(f)[0] == {repr(name)}:
         target = f
         break
 
 if target is None:
-    print(f"Dataset '{repr(ds_name)}' not found. Available: {{files}}")
+    print(f"Dataset '{repr(name)}' not found. Available: {{files}}")
 else:
     df = pd.read_csv(os.path.join(DATASETS_DIR, target))
     print(f"Shape: {{df.shape}}")
@@ -379,24 +196,249 @@ else:
     print(f"\\nNull counts:\\n{{df.isnull().sum()}}")
     print(f"\\nDescribe:\\n{{df.describe()}}")
 """
-        result = execute_python(code, workspace_dir, timeout=30)
-        output = result.stdout or result.stderr or "No output"
-        return {"output": output, "artifacts": []}
+    result = execute_python(code, workspace_dir, timeout=30)
+    output = result.stdout or result.stderr or "No output"
 
-    elif name == "create_visualization":
-        code = args.get("code", "")
-        if not code:
-            code = _generate_viz_code(args)
-        result = execute_python(code, workspace_dir, timeout=30)
+    result_queue.append(("tool_result", {"tool": "describe_dataset", "result": output}))
+    return output
 
-        output = result.stdout or "(visualization created)"
-        if result.stderr and result.returncode != 0:
-            output = f"Error: {result.stderr}"
 
-        return {"output": output, "artifacts": result.artifacts}
+@tool(context=True)
+def create_visualization(chart_type: str, tool_context: ToolContext, dataset: str = "", x_column: str = "", y_column: str = "", title: str = "", code: str = "") -> str:
+    """Create a data visualization. Generates a matplotlib/seaborn chart and saves it as PNG. Specify the chart type, data source, and any customization.
 
-    else:
-        return {"output": f"Unknown tool: {name}", "artifacts": []}
+    Args:
+        chart_type: Type of chart (bar, line, scatter, histogram, heatmap, box, pie, etc.)
+        dataset: Dataset filename to visualize
+        x_column: Column for x-axis
+        y_column: Column for y-axis
+        title: Chart title
+        code: Custom matplotlib/seaborn code to execute for complex visualizations
+    """
+    state = tool_context.invocation_state
+    workspace_dir = state["workspace_dir"]
+    workspace_id = state["workspace_id"]
+    result_queue = state["_result_queue"]
+
+    exec_code = code
+    if not exec_code:
+        exec_code = _generate_viz_code({
+            "chart_type": chart_type,
+            "dataset": dataset,
+            "x_column": x_column,
+            "y_column": y_column,
+            "title": title,
+        })
+
+    result = execute_python(exec_code, workspace_dir, timeout=30)
+
+    output = result.stdout or "(visualization created)"
+    if result.stderr and result.returncode != 0:
+        output = f"Error: {result.stderr}"
+
+    result_queue.append(("tool_result", {"tool": "create_visualization", "result": output}))
+    for artifact in result.artifacts:
+        if artifact["category"] == "visualizations":
+            result_queue.append(
+                (
+                    "visualization",
+                    {
+                        "data": {
+                            "name": artifact["name"],
+                            "imageUrl": f"/workspace/{workspace_id}/visualizations/{artifact['name']}",
+                            "format": artifact["name"].rsplit(".", 1)[-1] if "." in artifact["name"] else "png",
+                        }
+                    },
+                )
+            )
+
+    return output
+
+
+@tool(context=True)
+def save_script(filename: str, code: str, tool_context: ToolContext) -> str:
+    """Save a reusable Python script to the workspace scripts directory. Use this after writing analysis or data processing code that the user may want to reuse or reference later.
+
+    Args:
+        filename: Script filename (e.g., 'clean_data.py', 'train_model.py')
+        code: The Python code to save
+    """
+    import os as _os
+    state = tool_context.invocation_state
+    workspace_dir = state["workspace_dir"]
+    result_queue = state["_result_queue"]
+
+    if not filename.endswith(".py"):
+        filename += ".py"
+
+    scripts_dir = _os.path.join(workspace_dir, "scripts")
+    _os.makedirs(scripts_dir, exist_ok=True)
+    filepath = _os.path.join(scripts_dir, filename)
+
+    with open(filepath, "w") as f:
+        f.write(code)
+
+    output = f"Script saved: {filename}"
+    result_queue.append(("tool_result", {"tool": "save_script", "result": output}))
+    return output
+
+
+@tool(context=True)
+def save_report(filename: str, content: str, tool_context: ToolContext) -> str:
+    """Save an analysis report or summary to the workspace reports directory. Use this after completing an analysis to document findings, methodology, and conclusions.
+
+    Args:
+        filename: Report filename (e.g., 'iris_analysis.md', 'model_evaluation.txt')
+        content: The report content (markdown or plain text)
+    """
+    import os as _os
+    state = tool_context.invocation_state
+    workspace_dir = state["workspace_dir"]
+    result_queue = state["_result_queue"]
+
+    if not any(filename.endswith(ext) for ext in (".md", ".txt", ".html")):
+        filename += ".md"
+
+    reports_dir = _os.path.join(workspace_dir, "reports")
+    _os.makedirs(reports_dir, exist_ok=True)
+    filepath = _os.path.join(reports_dir, filename)
+
+    with open(filepath, "w") as f:
+        f.write(content)
+
+    output = f"Report saved: {filename}"
+    result_queue.append(("tool_result", {"tool": "save_report", "result": output}))
+    return output
+
+
+ALL_TOOLS = [
+    execute_python_code,
+    load_dataset,
+    list_datasets,
+    describe_dataset,
+    create_visualization,
+    save_script,
+    save_report,
+]
+
+
+# ─── Agent factory ────────────────────────────────────────────────────────────
+
+
+def create_agent(config: LLMConfig) -> Agent:
+    """Create a Strands Agent configured for the given LLM provider."""
+    model = create_strands_model(config)
+    return Agent(
+        model=model,
+        system_prompt=SYSTEM_PROMPT,
+        tools=ALL_TOOLS,
+        callback_handler=None,
+    )
+
+
+# ─── SSE helpers ──────────────────────────────────────────────────────────────
+
+
+def _sse(event_type: str, data: dict) -> str:
+    """Format an SSE event line."""
+    payload = {"type": event_type, **data}
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+async def stream_agent(
+    prompt: str,
+    workspace_id: str,
+    workspace_root: str,
+    config: LLMConfig,
+    message_history: list[dict] | None = None,
+) -> AsyncGenerator[str, None]:
+    """Run the agent and yield SSE-formatted strings."""
+
+    workspace_dir = str(ensure_workspace(workspace_root, workspace_id))
+
+    # Side-channel list for tool_result/visualization events pushed by tools
+    result_queue: list[tuple[str, dict]] = []
+
+    agent = create_agent(config)
+
+    # If there's message history, set it on the agent
+    if message_history:
+        agent.messages.extend(message_history)
+
+    yield _sse("progress", {"message": "Thinking..."})
+
+    try:
+        async for event in agent.stream_async(
+            prompt,
+            invocation_state={
+                "workspace_dir": workspace_dir,
+                "workspace_root": workspace_root,
+                "workspace_id": workspace_id,
+                "_result_queue": result_queue,
+            },
+        ):
+            # Text content chunk
+            if "data" in event:
+                yield _sse("content/text/delta", {"content": event["data"]})
+
+            # Tool invocation
+            elif "current_tool_use" in event:
+                tool_use = event["current_tool_use"]
+                yield _sse(
+                    "tool_call",
+                    {
+                        "tool": tool_use.get("name", ""),
+                        "args": tool_use.get("input", {}),
+                        "tool_use_id": tool_use.get("toolUseId", ""),
+                    },
+                )
+
+            # Drain any queued tool_result / visualization events
+            while result_queue:
+                evt_type, evt_data = result_queue.pop(0)
+                yield _sse(evt_type, evt_data)
+    except Exception as e:
+        print(f"[agent] Error: {e}")
+        yield _sse("error", {"error": str(e)})
+
+    # Final drain
+    while result_queue:
+        evt_type, evt_data = result_queue.pop(0)
+        yield _sse(evt_type, evt_data)
+
+    yield _sse("done", {})
+
+
+# ─── Helpers (preserved from original) ────────────────────────────────────────
+
+
+def _generate_csv_meta(
+    workspace_root: str, workspace_id: str, workspace_dir: str, filename: str
+) -> None:
+    """Read a CSV and save metadata."""
+    import csv as csv_mod
+    from pathlib import Path
+
+    fpath = Path(workspace_dir) / "datasets" / filename
+    if not fpath.exists():
+        return
+
+    try:
+        with open(fpath, "r") as f:
+            reader = csv_mod.reader(f)
+            headers = next(reader, [])
+            row_count = sum(1 for _ in reader)
+
+        save_dataset_meta(
+            workspace_root,
+            workspace_id,
+            filename,
+            rows=row_count,
+            columns=len(headers),
+            column_names=headers,
+        )
+    except Exception:
+        pass
 
 
 def _generate_load_dataset_code(name: str, description: str | None = None) -> str:
@@ -458,14 +500,19 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import os
 
-# Dark theme
+# Dark theme — Bloomberg terminal meets Tufte
 plt.style.use('dark_background')
-plt.rcParams['figure.facecolor'] = '#111111'
-plt.rcParams['axes.facecolor'] = '#1a1a1a'
-plt.rcParams['text.color'] = '#f5f0e8'
-plt.rcParams['axes.labelcolor'] = '#c4bdb3'
-plt.rcParams['xtick.color'] = '#c4bdb3'
-plt.rcParams['ytick.color'] = '#c4bdb3'
+plt.rcParams['figure.facecolor'] = '#0d1117'
+plt.rcParams['axes.facecolor'] = '#0d1117'
+plt.rcParams['text.color'] = '#c9d1d9'
+plt.rcParams['axes.labelcolor'] = '#8b949e'
+plt.rcParams['xtick.color'] = '#8b949e'
+plt.rcParams['ytick.color'] = '#8b949e'
+plt.rcParams['axes.edgecolor'] = '#21262d'
+plt.rcParams['grid.color'] = '#21262d'
+plt.rcParams['grid.alpha'] = 0.3
+plt.rcParams['axes.grid'] = True
+plt.rcParams['font.size'] = 11
 
 # Load data
 files = os.listdir(DATASETS_DIR)
@@ -492,24 +539,24 @@ if df is not None:
     y_col = {repr(y)} or (df.columns[1] if len(df.columns) > 1 else df.columns[0])
 
     if {repr(chart_type)} == 'histogram':
-        ax.hist(df[x_col].dropna(), bins=30, color='#d4a843', alpha=0.8, edgecolor='#111111')
+        ax.hist(df[x_col].dropna(), bins=30, color='#58a6ff', alpha=0.8, edgecolor='#111111')
     elif {repr(chart_type)} == 'scatter':
-        ax.scatter(df[x_col], df[y_col], color='#d4a843', alpha=0.6, s=20)
+        ax.scatter(df[x_col], df[y_col], color='#58a6ff', alpha=0.6, s=20)
     elif {repr(chart_type)} == 'line':
-        ax.plot(df[x_col], df[y_col], color='#d4a843', linewidth=1.5)
+        ax.plot(df[x_col], df[y_col], color='#58a6ff', linewidth=1.5)
     elif {repr(chart_type)} == 'box':
         df.boxplot(ax=ax, patch_artist=True,
-                   boxprops=dict(facecolor='#d4a843', alpha=0.3),
-                   medianprops=dict(color='#d4a843'))
+                   boxprops=dict(facecolor='#58a6ff', alpha=0.3),
+                   medianprops=dict(color='#58a6ff'))
     elif {repr(chart_type)} == 'heatmap':
         numeric_df = df.select_dtypes(include='number')
         sns.heatmap(numeric_df.corr(), annot=True, cmap='YlOrBr', ax=ax)
     else:  # bar
         if df[x_col].dtype == 'object':
             counts = df[x_col].value_counts().head(20)
-            ax.bar(counts.index, counts.values, color='#d4a843', alpha=0.8)
+            ax.bar(counts.index, counts.values, color='#58a6ff', alpha=0.8)
         else:
-            ax.bar(range(min(20, len(df))), df[y_col].head(20), color='#d4a843', alpha=0.8)
+            ax.bar(range(min(20, len(df))), df[y_col].head(20), color='#58a6ff', alpha=0.8)
 
     ax.set_title({repr(title)}, fontsize=14, pad=15)
     ax.set_xlabel(x_col)
@@ -520,83 +567,3 @@ if df is not None:
 else:
     print("No data available to visualize")
 """
-
-
-def _generate_csv_meta(
-    workspace_root: str, workspace_id: str, workspace_dir: str, filename: str
-) -> None:
-    """Read a CSV and save metadata."""
-    import csv as csv_mod
-    from pathlib import Path
-
-    fpath = Path(workspace_dir) / "datasets" / filename
-    if not fpath.exists():
-        return
-
-    try:
-        with open(fpath, "r") as f:
-            reader = csv_mod.reader(f)
-            headers = next(reader, [])
-            row_count = sum(1 for _ in reader)
-
-        save_dataset_meta(
-            workspace_root,
-            workspace_id,
-            filename,
-            rows=row_count,
-            columns=len(headers),
-            column_names=headers,
-        )
-    except Exception:
-        pass
-
-
-def _format_tools_for_provider(provider: str) -> list[dict]:
-    """Format tool definitions for the LLM provider."""
-    if provider == "anthropic":
-        return ALL_TOOLS
-    elif provider in ("openai", "ollama"):
-        return [_to_openai_tool(t) for t in ALL_TOOLS]
-    return ALL_TOOLS
-
-
-def _to_openai_tool(tool: dict) -> dict:
-    """Convert Anthropic tool format to OpenAI function format."""
-    return {
-        "type": "function",
-        "function": {
-            "name": tool["name"],
-            "description": tool["description"],
-            "parameters": tool["input_schema"],
-        },
-    }
-
-
-def _to_openai_message(msg: dict) -> dict:
-    """Convert message to OpenAI format."""
-    if isinstance(msg.get("content"), list):
-        # Tool result or multi-part content
-        parts = msg["content"]
-        for part in parts:
-            if part.get("type") == "tool_result":
-                return {
-                    "role": "tool",
-                    "tool_call_id": part.get("tool_use_id", ""),
-                    "content": part.get("content", ""),
-                }
-        # Multi-part text
-        text = " ".join(p.get("text", str(p.get("content", ""))) for p in parts)
-        return {"role": msg["role"], "content": text}
-    return {"role": msg["role"], "content": msg.get("content", "")}
-
-
-def _truncate(s: str, max_len: int) -> str:
-    if len(s) <= max_len:
-        return s
-    return s[: max_len - 100] + f"\n... (truncated, {len(s)} total chars)"
-
-
-def _sse(event_type: str, data: dict) -> str:
-    """Format an SSE event line."""
-    payload = {"type": event_type, **data}
-    return f"data: {json.dumps(payload)}\n\n"

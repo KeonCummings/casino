@@ -49,5 +49,34 @@ class AppConfig:
         )
 
 
+def create_strands_model(config: LLMConfig):
+    """Create the appropriate Strands model provider from LLMConfig."""
+    if config.provider == "anthropic":
+        from strands.models.anthropic import AnthropicModel
+
+        return AnthropicModel(
+            client_args={"api_key": config.api_key} if config.api_key else None,
+            model_id=config.model,
+            max_tokens=config.max_tokens,
+        )
+    elif config.provider == "openai":
+        from strands.models.openai import OpenAIModel
+
+        return OpenAIModel(
+            client_args={"api_key": config.api_key} if config.api_key else None,
+            model_id=config.model,
+            params={"max_tokens": config.max_tokens, "temperature": config.temperature},
+        )
+    elif config.provider == "ollama":
+        from strands.models.ollama import OllamaModel
+
+        return OllamaModel(
+            host=config.base_url or "http://localhost:11434",
+            model_id=config.model,
+        )
+    else:
+        raise ValueError(f"Unknown provider: {config.provider}")
+
+
 def get_config() -> AppConfig:
     return AppConfig()

@@ -68,13 +68,14 @@ import matplotlib.pyplot as plt
 
 # Override plt.show to save instead
 _original_show = plt.show
+import time as _time
 _plot_counter = [0]
 def _save_show(*args, **kwargs):
     _plot_counter[0] += 1
     fig = plt.gcf()
-    name = f"plot_{{_plot_counter[0]}}.png"
+    name = f"plot_{{int(_time.time()*1000)}}_{{_plot_counter[0]}}.png"
     path = os.path.join(VISUALIZATIONS_DIR, name)
-    fig.savefig(path, dpi=150, bbox_inches='tight', facecolor='#111111', edgecolor='none')
+    fig.savefig(path, dpi=150, bbox_inches='tight', facecolor='#0d1117', edgecolor='none')
     plt.close(fig)
 plt.show = _save_show
 

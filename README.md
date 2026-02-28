@@ -1,32 +1,55 @@
-# Casino
+# Ca$ino
 
-A local data-science agent that executes Python code, creates visualizations, and manages datasets — all through a streaming API.
+A data storyteller that thinks out loud. Ca$ino is an AI agent that doesn't just analyze data — it interrogates it, finds the story hiding in the numbers, and makes you feel it through visuals that land.
 
-Bring your own LLM key. Everything runs on your machine.
+Powered by [Strands Agents SDK](https://github.com/strands-agents/sdk-python). Bring your own LLM key. Everything runs on your machine.
 
 ## Quick start
 
 ```bash
-git clone https://github.com/keon/casino.git
+git clone https://github.com/KeonCummings/casino.git
 cd casino
-cp .env.example .env   # add your API key
+```
+
+Create a `.env` file:
+
+```bash
+echo 'LLM_PROVIDER=anthropic' > .env
+echo 'LLM_API_KEY=your-key-here' >> .env
 ```
 
 **With Docker:**
 
 ```bash
-docker compose up
+docker compose up --build
 ```
 
-**Without Docker:**
+**With Python (3.10+):**
 
 ```bash
 cd backend
 pip install -r requirements.txt
+export $(cat ../.env | xargs)
 python main.py
 ```
 
 The API runs at `http://localhost:8000`.
+
+## What it does
+
+Ask Ca$ino to analyze data and it will execute code, create visualizations, train models, and save artifacts — all autonomously. It thinks like a data journalist: skeptical, curious, hunting for what's interesting.
+
+```bash
+# Create a workspace
+curl -s -X POST localhost:8000/workspaces \
+  -H "Content-Type: application/json" \
+  -d '{"name":"demo"}' | python3 -m json.tool
+
+# Ask it something
+curl -N -X POST localhost:8000/stream \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"load the iris dataset and show me something interesting","workspaceId":"<id>"}'
+```
 
 ## Configuration
 
@@ -37,15 +60,43 @@ Set these in `.env`:
 | `LLM_PROVIDER` | `anthropic` | `anthropic`, `openai`, or `ollama` |
 | `LLM_API_KEY` | — | Your API key (not needed for Ollama) |
 | `LLM_MODEL` | auto | Model name (auto-selects per provider) |
-| `CASINO_SANDBOX` | `subprocess` | `subprocess` or `docker` |
+| `LLM_BASE_URL` | — | Custom endpoint (required for Ollama if not localhost) |
 | `CASINO_EXEC_TIMEOUT` | `30` | Code execution timeout (seconds) |
+
+**Provider defaults:**
+
+| Provider | Default model |
+|---|---|
+| `anthropic` | `claude-sonnet-4-20250514` |
+| `openai` | `gpt-4o` |
+| `ollama` | `llama3.1` |
+
+## Tools
+
+Ca$ino has 7 tools, all defined as Strands `@tool` decorators with auto-generated schemas:
+
+| Tool | What it does |
+|---|---|
+| `execute_python_code` | Run Python with pandas, numpy, matplotlib, seaborn, sklearn, scipy |
+| `load_dataset` | Load iris, titanic, wine, tips, penguins, etc. or generate synthetic data |
+| `list_datasets` | List datasets in the workspace |
+| `describe_dataset` | Get shape, dtypes, describe(), null counts |
+| `create_visualization` | Generate charts from a dataset |
+| `save_script` | Save reusable Python code to the scripts directory |
+| `save_report` | Save analysis reports and summaries as markdown |
+
+**Automatic artifact capture:**
+- `plt.show()` saves PNGs to visualizations with unique timestamped filenames
+- CSVs saved to `DATASETS_DIR` get metadata indexed automatically
+- Models saved via `joblib.dump()` to `MODELS_DIR` appear in the models list
+- Stray image/data files in the workspace root are moved to the right directory
 
 ## API
 
 ### Stream a query
 
 ```bash
-curl -X POST http://localhost:8000/stream \
+curl -N -X POST http://localhost:8000/stream \
   -H "Content-Type: application/json" \
   -d '{"prompt": "load the iris dataset and create a scatter plot", "workspaceId": "ws_1"}'
 ```
@@ -54,10 +105,10 @@ Returns SSE events:
 
 ```
 data: {"type": "progress", "message": "Thinking..."}
-data: {"type": "content/text/delta", "content": "I'll load the iris dataset..."}
-data: {"type": "tool_call", "tool": "execute_python", "args": {"code": "..."}}
-data: {"type": "tool_result", "tool": "execute_python", "result": "..."}
-data: {"type": "visualization", "data": {"name": "plot_1", "imageUrl": "/workspace/ws_1/visualizations/plot_1.png"}}
+data: {"type": "content/text/delta", "content": "Let me look at this..."}
+data: {"type": "tool_call", "tool": "execute_python_code", "args": {"code": "..."}}
+data: {"type": "tool_result", "tool": "execute_python_code", "result": "..."}
+data: {"type": "visualization", "data": {"name": "plot_1719000000_1.png", ...}}
 data: {"type": "done"}
 ```
 
@@ -65,69 +116,47 @@ data: {"type": "done"}
 
 ```bash
 # Create
-curl -X POST http://localhost:8000/workspaces -H "Content-Type: application/json" -d '{"name": "my-project"}'
+curl -X POST localhost:8000/workspaces -H "Content-Type: application/json" -d '{"name": "my-project"}'
 
 # List
-curl http://localhost:8000/workspaces
+curl localhost:8000/workspaces
 
 # Delete
-curl -X DELETE http://localhost:8000/workspaces/ws_123
+curl -X DELETE localhost:8000/workspaces/{id}
 ```
 
 ### Artifacts
 
 ```bash
-# Datasets
-curl http://localhost:8000/workspaces/ws_1/datasets
-curl http://localhost:8000/workspaces/ws_1/datasets/iris/preview
-
-# Visualizations
-curl http://localhost:8000/workspaces/ws_1/visualizations
-
-# Scripts / Reports / Models
-curl http://localhost:8000/workspaces/ws_1/scripts
-curl http://localhost:8000/workspaces/ws_1/reports
-curl http://localhost:8000/workspaces/ws_1/models
+curl localhost:8000/workspaces/{id}/datasets
+curl localhost:8000/workspaces/{id}/datasets/{name}/preview
+curl localhost:8000/workspaces/{id}/visualizations
+curl localhost:8000/workspaces/{id}/scripts
+curl localhost:8000/workspaces/{id}/reports
+curl localhost:8000/workspaces/{id}/models
 
 # Serve files directly
-curl http://localhost:8000/workspace/ws_1/visualizations/plot_1.png --output plot.png
+curl localhost:8000/workspace/{id}/visualizations/plot.png --output plot.png
 ```
-
-## Tools
-
-The agent has these tools:
-
-| Tool | What it does |
-|---|---|
-| `execute_python` | Run arbitrary Python with pandas, numpy, matplotlib, seaborn, sklearn, scipy |
-| `load_dataset` | Load iris, titanic, wine, tips, penguins, etc. or generate synthetic data |
-| `list_datasets` | List datasets in the workspace |
-| `describe_dataset` | Get shape, dtypes, describe(), null counts |
-| `create_visualization` | Generate charts from a dataset |
-
-Code execution auto-captures artifacts:
-- `plt.show()` saves PNGs to the visualizations directory
-- CSVs saved to `DATASETS_DIR` appear in datasets
-- Any image files in the workspace root are moved to visualizations
-
-## Security
-
-**Default mode (`subprocess`)**: The agent executes LLM-generated Python code directly on your machine via subprocess. There is a 30-second timeout but no sandbox. Only run this locally with API keys you control.
 
 ## Architecture
 
 ```
 backend/
-├── main.py           # FastAPI — SSE streaming, REST endpoints, static files
-├── agent.py          # LLM loop — call model → tools → stream events
+├── main.py           # FastAPI — SSE streaming, REST endpoints
+├── agent.py          # Strands Agent — @tool functions, persona, streaming
 ├── executor.py       # Python subprocess execution + artifact capture
 ├── artifacts.py      # Filesystem CRUD for workspace data
-├── config.py         # Provider config (Anthropic/OpenAI/Ollama)
-└── tools/
-    ├── code_interpreter.py
-    ├── dataset_tools.py
-    └── visualization_tools.py
+├── config.py         # Provider config + Strands model factory
+├── Dockerfile
+└── requirements.txt
 ```
+
+The agent is stateless per request — a fresh `Agent` instance is created for each `/stream` call. Tools communicate side-channel SSE events (tool results, visualizations) via a shared queue in `invocation_state`.
+
+## Security
+
+Code execution runs LLM-generated Python directly on your machine via subprocess with a 30-second timeout. There is no sandbox. Only run this locally with API keys you control.
 
 ## License
 

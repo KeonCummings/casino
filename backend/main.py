@@ -6,7 +6,7 @@ FastAPI server with SSE streaming, artifact REST endpoints, and static file serv
 import os
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -130,6 +130,43 @@ async def get_preview(workspace_id: str, name: str, limit: int = 10):
     if preview is None:
         return JSONResponse({"error": "Dataset not found"}, status_code=404)
     return preview
+
+
+@app.post("/workspaces/{workspace_id}/datasets/upload")
+async def upload_dataset(workspace_id: str, file: UploadFile = File(...)):
+    """Upload a CSV/TSV/JSON file to the workspace datasets directory."""
+    allowed = (".csv", ".tsv", ".json", ".parquet", ".xlsx")
+    ext = Path(file.filename).suffix.lower() if file.filename else ""
+    if ext not in allowed:
+        return JSONResponse(
+            {"error": f"Unsupported file type '{ext}'. Allowed: {', '.join(allowed)}"},
+            status_code=400,
+        )
+
+    ds_dir = Path(cfg.workspace_root) / workspace_id / "datasets"
+    ds_dir.mkdir(parents=True, exist_ok=True)
+    dest = ds_dir / file.filename
+
+    contents = await file.read()
+    dest.write_bytes(contents)
+
+    # Generate metadata for CSV files
+    meta = {"name": file.filename, "size": len(contents)}
+    if ext == ".csv":
+        import csv, io
+
+        reader = csv.reader(io.StringIO(contents.decode("utf-8", errors="replace")))
+        headers = next(reader, [])
+        row_count = sum(1 for _ in reader)
+        from artifacts import save_dataset_meta
+
+        save_dataset_meta(
+            cfg.workspace_root, workspace_id, file.filename,
+            rows=row_count, columns=len(headers), column_names=headers,
+        )
+        meta.update({"rows": row_count, "columns": len(headers)})
+
+    return {"uploaded": meta}
 
 
 # ─── Visualizations ──────────────────────────────────────────────────────────

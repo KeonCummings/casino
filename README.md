@@ -91,6 +91,39 @@ Ca$ino has 7 tools, all defined as Strands `@tool` decorators with auto-generate
 - Models saved via `joblib.dump()` to `MODELS_DIR` appear in the models list
 - Stray image/data files in the workspace root are moved to the right directory
 
+## Bring your own data
+
+Ca$ino works with your data, not just built-in datasets. Three ways to get data in:
+
+**Upload via API:**
+
+```bash
+curl -X POST localhost:8000/workspaces/{id}/datasets/upload \
+  -F "file=@/path/to/your/data.csv"
+```
+
+Supports CSV, TSV, JSON, Parquet, and Excel files. CSV files get metadata indexed automatically.
+
+**Drop files directly:**
+
+Copy files into the workspace datasets folder:
+
+```bash
+cp sales_2024.csv backend/workspace/{workspace_id}/datasets/
+```
+
+The agent sees everything in the datasets directory — just ask it to "analyze sales_2024.csv".
+
+**Let the agent fetch it:**
+
+```bash
+curl -N -X POST localhost:8000/stream \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"load the titanic dataset and tell me who survived","workspaceId":"<id>"}'
+```
+
+Ca$ino knows 10+ built-in datasets (iris, titanic, wine, tips, penguins, diamonds, etc.) and can generate synthetic data on the fly.
+
 ## API
 
 ### Stream a query
@@ -128,6 +161,9 @@ curl -X DELETE localhost:8000/workspaces/{id}
 ### Artifacts
 
 ```bash
+# Upload your own data
+curl -X POST localhost:8000/workspaces/{id}/datasets/upload -F "file=@data.csv"
+
 curl localhost:8000/workspaces/{id}/datasets
 curl localhost:8000/workspaces/{id}/datasets/{name}/preview
 curl localhost:8000/workspaces/{id}/visualizations

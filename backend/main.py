@@ -12,7 +12,7 @@ from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from config import get_config
-from agent import run_agent
+from agent import stream_agent
 from artifacts import (
     create_workspace,
     list_workspaces,
@@ -82,7 +82,7 @@ async def stream(request: Request):
         )
 
     async def event_stream():
-        async for chunk in run_agent(
+        async for chunk in stream_agent(
             prompt=prompt,
             workspace_id=workspace_id,
             workspace_root=cfg.workspace_root,
@@ -191,4 +191,10 @@ async def serve_artifact(workspace_id: str, category: str, filename: str):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host=cfg.host, port=cfg.port, reload=True)
+    uvicorn.run(
+        "main:app",
+        host=cfg.host,
+        port=cfg.port,
+        reload=True,
+        reload_excludes=["workspace/*", "*.pyc"],
+    )
